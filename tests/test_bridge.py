@@ -113,6 +113,23 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIn('model_reasoning_effort="low"', self._args(None, effort="low"))
 
 
+class TestCwdDefault(unittest.TestCase):
+    def test_cwd_none_uses_getcwd(self):
+        # domain-agnostic default: cwd=None -> the round-1 argv carries os.getcwd()
+        seen = {}
+
+        def fake(args, **kw):
+            seen["args"] = args
+            return _fake_run()
+
+        with _fake_temp(), mock.patch.object(bridge.subprocess, "run", side_effect=fake), \
+             mock.patch.object(bridge.os, "getcwd", return_value="/here/now"), \
+             mock.patch.object(bridge.Path, "read_text", return_value="ok"):
+            bridge.ask_codex("p")          # no cwd -> defaults to getcwd()
+        i = seen["args"].index("-C")
+        self.assertEqual(seen["args"][i + 1], "/here/now")
+
+
 class TestAskCodexErrorPaths(unittest.TestCase):
     def _run(self, **patch_run):
         with _fake_temp(), mock.patch.object(bridge.subprocess, "run", **patch_run):

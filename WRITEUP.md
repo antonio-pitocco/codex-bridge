@@ -24,21 +24,24 @@ loop:
 
 - **The implementer** (here, Claude) proposes and is the only one who writes code.
 - **The reviewer** (here, OpenAI's Codex) runs in a **read-only sandbox**. It can
-  read the whole repo and run read-only commands to ground its critique — but it
-  **physically cannot edit a file.** Its only available move is to find defects.
+  read the whole repo and run read-only commands to ground its critique — but the
+  CLI runner **blocks its file writes**. Its only available move is to find defects.
 
 They exchange proposals until they reach consensus; then the implementer ships.
 
-The key design decision is that the asymmetry is **enforced by the sandbox, not by
+The key design decision is that the asymmetry comes from the **sandbox runner, not
 the prompt.** "Please only review, don't edit" is a suggestion a model can ignore.
-`codex exec -s read-only` is a wall.
+`codex exec -s read-only` makes the runner refuse the writes instead.
 
 Three more things make it more than "two chatbots talking":
 
-1. **Anti-sycophancy is structural.** Consensus requires a minimum number of
-   adversarial rounds that scales with risk (`trivial: 1, standard: 2, critical: 3`).
-   The reviewer literally cannot rubber-stamp critical code on round one. This lives
-   in a tested function, not in the orchestrator's good intentions.
+1. **Anti-sycophancy can be made structural.** `codex-bridge` ships a tested
+   decision function, `consensus_reached`; if your loop uses it, an early `AGREE`
+   does not count as consensus until a minimum number of adversarial rounds has
+   happened, scaling with risk (`trivial: 1, standard: 2, critical: 3`). So the gate
+   refuses to count a round-one `AGREE` for critical work — the rule lives in tested
+   code, not in the orchestrator's good intentions. (The bridge exposes the rule;
+   your loop has to honor it.)
 2. **The verdict is machine-readable and fail-safe.** Only a clean `VERDICT: AGREE`
    on the last line counts. `AGREE with caveats`, text after the verdict, or a
    missing line all parse to `MALFORMED` — *not consensus*. You never ship on an
@@ -85,9 +88,10 @@ holes anyway.
 
 ## Why the anti-sycophancy floor mattered
 
-In every round the reviewer was *forbidden* from agreeing too early. That single
-rule is what forced genuine iteration instead of a polite "looks good." On the
-verdict-parser bug, a one-round rubber stamp would have shipped it. The floor is
+In every round the process *refused to accept* early agreement — the gate didn't
+count an `AGREE` as consensus until enough adversarial rounds had happened. That
+single rule is what forced genuine iteration instead of a polite "looks good." On
+the verdict-parser bug, a one-round rubber stamp would have shipped it. The floor is
 the difference between a real adversary and a flattering mirror.
 
 ## Honest limitations

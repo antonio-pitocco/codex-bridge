@@ -18,8 +18,12 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+test = ["pytest"]
+
 [project.urls]
-Homepage = "https://github.com/"  # set on publish
+Homepage = "https://github.com/servizigiudiziari-prog/codex-bridge"
+Repository = "https://github.com/servizigiudiziari-prog/codex-bridge"
 
 [project.scripts]
 codex-bridge = "codex_bridge.bridge:main"

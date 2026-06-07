@@ -6,8 +6,10 @@ until they reach consensus, then the implementer ships. The asymmetry is enforce
 by the sandbox, not by a polite instruction in the prompt.
 
 A model reviewing its own work is sycophantic. `codex-bridge` makes the reviewer
-a **different vendor's model** that physically cannot edit your files — so its job
-is only to find what's wrong. It's small (one file), headless, and tested.
+a **different vendor's model** whose file writes are blocked by the Codex CLI
+read-only sandbox in normal operation — so its job is only to find what's wrong.
+`codex-bridge` is the small (one-file) *primitive*; the debate loop is a thin layer
+you drive on top of it (see below).
 
 > Built and battle-tested by driving an [OpenAI Codex CLI](https://github.com/openai/codex)
 > reviewer against a Claude implementer on a real production codebase. See
@@ -16,14 +18,16 @@ is only to find what's wrong. It's small (one file), headless, and tested.
 
 ## Why this and not "ask the model to double-check"
 
-- **The reviewer cannot write.** It runs in a `read-only` sandbox (`codex exec -s read-only`).
-  It can read your repo and run read-only commands to ground its critique, but it
-  cannot touch a single file. Only the implementer ships. This is the core idea.
-- **Anti-sycophancy is structural, not a vibe.** Consensus requires a *minimum
-  number of adversarial rounds* that scales with the topic's risk
-  (`MIN_ROUNDS = {trivial: 1, standard: 2, critical: 3}`) — so the reviewer can't
-  rubber-stamp on round one. This is tested code (`consensus_reached`), not the
-  orchestrator's discipline.
+- **The reviewer doesn't write.** It runs in a `read-only` sandbox (`codex exec -s read-only`):
+  the Codex CLI runner blocks file writes, so the reviewer can read your repo and run
+  read-only commands to ground its critique but does not edit it. Only the implementer
+  ships. This is the core idea — the asymmetry comes from the runner, not a prompt.
+- **Anti-sycophancy can be made structural.** `codex-bridge` ships a tested
+  decision function, `consensus_reached`, that refuses to count an `AGREE` as
+  consensus until a *minimum number of adversarial rounds* has happened, scaling
+  with risk (`MIN_ROUNDS = {trivial: 1, standard: 2, critical: 3}`). If your loop
+  uses it, the reviewer can't rubber-stamp critical code on round one. The bridge
+  exposes the rule; it's up to your loop to honor it.
 - **The verdict is machine-readable and fail-safe.** `parse_verdict` only accepts a
   clean `VERDICT: AGREE` as the *last line*; anything else (`AGREE with caveats`,
   text after the verdict, missing) is `MALFORMED` — i.e. *not consensus*. You never
@@ -121,6 +125,9 @@ MIT © 2026 Antonio Pitocco
 ## Tests
 
 ```bash
-python -m pytest tests/ -q          # hermetic unit tests (no real Codex)
-CODEX_BRIDGE_IT=1 python -m pytest tests/test_integration.py -q   # pins the real CLI contract
+pip install -e ".[test]"
+python -m pytest tests/test_bridge.py -q   # hermetic unit tests (no real Codex)
+# CLI-contract integration tests (pin the `codex exec`/`resume` flags this driver
+# relies on; skipped unless enabled — they check the flag contract, not a full run):
+CODEX_BRIDGE_IT=1 python -m pytest tests/test_integration.py -q
 ```

@@ -22,8 +22,8 @@ dependencies = []
 test = ["pytest"]
 
 [project.urls]
-Homepage = "https://github.com/servizigiudiziari-prog/codex-bridge"
-Repository = "https://github.com/servizigiudiziari-prog/codex-bridge"
+Homepage = "https://github.com/antonio-pitocco/codex-bridge"
+Repository = "https://github.com/antonio-pitocco/codex-bridge"
 
 [project.scripts]
 codex-bridge = "codex_bridge.bridge:main"

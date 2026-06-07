@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-bridge"
+version = "0.1.0"
+description = "Enforced adversarial code review between two models: one implements, the other (sandboxed read-only) verifies."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Antonio Pitocco" }]
+keywords = ["llm", "agents", "code-review", "adversarial", "codex", "claude", "multi-agent"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/"  # set on publish
+
+[project.scripts]
+codex-bridge = "codex_bridge.bridge:main"
+
+[tool.setuptools]
+packages = ["codex_bridge"]

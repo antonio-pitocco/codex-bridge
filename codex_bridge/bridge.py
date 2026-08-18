@@ -1,7 +1,7 @@
 """Headless driver to talk to the Codex CLI (gpt-5.x) programmatically.
 
 Uses `codex exec` (NOT the interactive TUI, which is fragile to drive):
-- Codex's final message is captured cleanly via `-o <file>`;
+- the reviewer's messages are captured from the `--json` event stream;
 - the `thread_id` is extracted from the `--json` events (`thread.started`);
 - context across rounds is preserved with `codex exec resume <thread_id>`.
 
@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import tempfile
@@ -60,15 +61,30 @@ VALID_EFFORT = ("low", "medium", "high", "xhigh")
 @dataclass
 class CodexReply:
     """One round of the reviewer's reply."""
-    text: str                  # final message (the reviewer's opinion)
+    #: ALL assistant messages of the turn, in order — not just the last one.
+    #: `--output-last-message` writes only the final message, and a reviewer
+    #: often closes a turn with a short wrap-up: capturing only that silently
+    #: replaces the audit with its summary. See `_extract_agent_messages`.
+    text: str
     thread_id: str | None      # session id, to pass to the next round
     exit_code: int
     error: str = ""
-    error_kind: str = ""       # timeout|codex_missing|resume_invalid|run_error|empty_output|temp_unavailable
+    #: timeout|codex_missing|resume_invalid|run_error|empty_output|
+    #: temp_unavailable|degraded_last_only
+    error_kind: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.exit_code == 0 and bool(self.text)
+        """A DEGRADED round is not a valid round.
+
+        If the `--json` stream is truncated we can only fall back to the final
+        message — which is exactly the failure mode this driver exists to
+        avoid. Reporting it as `ok` would make the degradation visible but not
+        authoritative: an orchestrator that only skips `ok == false` rounds
+        would accept a wrap-up as if it were the audit.
+        """
+        return (self.exit_code == 0 and bool(self.text)
+                and self.error_kind != "degraded_last_only")
 
 
 # ADAPTIVE convergence: minimum adversarial rounds before the reviewer's AGREE
@@ -97,6 +113,43 @@ def consensus_reached(rounds_done: int, complexity: str, reviewer_verdict: str,
     return verdict == "AGREE" and implementer_satisfied and rounds_done >= MIN_ROUNDS[key]
 
 
+# INDICATIVE ceiling of rounds. It is an attention threshold, not a ban:
+# see `should_continue_past_cap`.
+ROUND_CAP = {"trivial": 3, "standard": 3, "critical": 5}
+
+
+def should_continue_past_cap(
+    rounds_done: int,
+    complexity: str,
+    last_round_new_accepted_defects: int,
+    disagreement_is_on_merit: bool,
+) -> bool:
+    """True if the debate MUST continue past the indicative round ceiling.
+
+    The cap exists to stop unproductive loops, but a pure round count can do the
+    opposite damage: on a real review, five rounds produced 33 genuine defects
+    and the fifth round still found two more — both accepted without pushback —
+    yet the rule said "stop". Stopping while the reviewer is still finding real
+    defects is the opposite of why the loop exists.
+
+    The discriminator is not the round number but the nature of the last round:
+
+      * the last round produced new defects that were **accepted and fixed**
+        (not disputed) -> the debate is still producing value: CONTINUE;
+      * the last round produced no accepted defects -> either it is a loop, or
+        the remaining objections are disputed: STOP and escalate to a human with
+        the residual disagreement, which at that point is genuinely on the merits.
+
+    `disagreement_is_on_merit` is the explicit valve: if the divergence is about
+    a judgement call and not a defect, more rounds will not dissolve it.
+    """
+    if disagreement_is_on_merit:
+        return False
+    if rounds_done < ROUND_CAP.get((complexity or "").strip().lower(), 5):
+        return True          # below the ceiling we continue anyway
+    return last_round_new_accepted_defects > 0
+
+
 def _codex_bin() -> str:
     return shutil.which("codex") or os.path.expanduser("~/.npm-global/bin/codex")
 
@@ -117,11 +170,61 @@ def _extract_thread_id(stdout: str | None, fallback: str | None) -> str | None:
     return tid
 
 
+def _extract_agent_messages(stdout: str | None) -> tuple[list[str], bool]:
+    """(COMPLETED assistant messages in order, is the stream intact?).
+
+    Event shape verified live against the `--json` output, not inferred:
+    `{"type":"item.completed","item":{"type":"agent_message","text":"…"}}`.
+
+    This exists because `--output-last-message` writes ONLY the final message:
+    when the reviewer emits a long analysis and then a short closing wrap-up,
+    a driver reading that file hands you the wrap-up and throws the analysis
+    away. A reviewer that delivers its summary instead of its audit is a
+    safeguard that has been silently switched off.
+
+    **Only `item.completed`.** Matching on `item.type` alone also accepted
+    `item.updated` partials, and then: a partial duplicated the text of the
+    completion that followed it, and a partial left alone suppressed the
+    fallback because `text` was not empty.
+
+    The second value is `False` when the stream is NOT intact — a truncated
+    JSON line, or a missing `turn.completed`. The caller must be able to
+    declare that instead of presenting a partial audit as a complete one.
+    """
+    out: list[str] = []
+    intact = False
+    malformed = False
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            malformed = True
+            continue
+        if not isinstance(ev, dict):
+            malformed = True
+            continue
+        if ev.get("type") == "turn.completed":
+            intact = True
+            continue
+        if ev.get("type") != "item.completed":
+            continue
+        item = ev.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            out.append(text.strip())
+    return out, (intact and not malformed)
+
+
 def _classify_error(returncode: int, stderr: str) -> str:
     """Classify the failure so the caller can branch deterministically.
 
-    Only `resume_invalid` is confirmed by codex's stderr format; the others are
-    derived from the exit code. Not an exhaustive classifier: a useful label.
+    Only `resume_invalid` is confirmed by the CLI's stderr format; the others
+    are derived from the exit code. Not an exhaustive classifier: a useful label.
     """
     s = (stderr or "").lower()
     if returncode == 124:
@@ -152,6 +255,110 @@ def _build_args(codex, thread_id, sandbox, cwd, model, effort, last_path) -> lis
     return [codex, "exec", "-C", str(cwd), "-s", sandbox, "--color", "never", *out_opts, "-"]
 
 
+def _terminate_process_tree(proc: subprocess.Popen, grace_seconds: float = 0.5) -> None:
+    """Kill the reviewer process AND its children, leaving no live pipe or orphan.
+
+    On POSIX `_run_codex_process` starts a new session, so the process PID is
+    also the process-group ID: the timeout hits the whole group, first with
+    TERM and then with KILL. Without this, a grandchild that ignores TERM keeps
+    the pipes open and `communicate()` blocks well past the timeout — i.e. the
+    timeout silently does not exist. The direct-process fallback is only for
+    platforms without POSIX process groups.
+    """
+    if os.name == "posix":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            # Conservative: if the group is unreachable, at least the direct
+            # process must not stay alive.
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+    else:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+
+    try:
+        proc.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+
+    if os.name == "posix":
+        # Even if the parent already exited on TERM, a descendant may have
+        # ignored it and still hold the pipes. KILL on the group is therefore
+        # unconditional, not only when `proc.wait` times out.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+    elif proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    if proc.poll() is None:
+        try:
+            proc.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            # Do not wait indefinitely on the timeout path itself.
+            pass
+
+
+def _run_codex_process(
+    args: list[str],
+    prompt: str,
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    """Run the reviewer with a real timeout over the whole process tree."""
+    proc = subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=(os.name == "posix"),
+    )
+    try:
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        partial_stdout = exc.stdout
+        partial_stderr = exc.stderr
+        _terminate_process_tree(proc)
+        # After KILL the group's pipes must close. Do not turn a timeout into a
+        # second hang though: one last collection, strictly bounded, and the
+        # result stays a closed error either way.
+        try:
+            tail_stdout, tail_stderr = proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            tail_stdout, tail_stderr = "", ""
+        if isinstance(partial_stdout, bytes):
+            partial_stdout = partial_stdout.decode("utf-8", "replace")
+        if isinstance(partial_stderr, bytes):
+            partial_stderr = partial_stderr.decode("utf-8", "replace")
+        # `communicate()` after the kill normally returns everything buffered,
+        # not just a tail: preferring it avoids duplication.
+        final_stdout = tail_stdout if tail_stdout else (partial_stdout or "")
+        final_stderr = tail_stderr if tail_stderr else (partial_stderr or "")
+        raise subprocess.TimeoutExpired(
+            args,
+            timeout,
+            output=final_stdout,
+            stderr=final_stderr,
+        ) from None
+    return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+
+
 def ask_codex(
     prompt: str,
     thread_id: str | None = None,
@@ -162,7 +369,7 @@ def ask_codex(
     model: str | None = None,
     timeout: int = 1800,
 ) -> CodexReply:
-    """Send `prompt` to the reviewer model and return its final message + thread_id.
+    """Send `prompt` to the reviewer model and return its messages + thread_id.
 
     If `thread_id` is set, it resumes that session (the reviewer remembers the
     earlier exchange). The prompt is passed via stdin to avoid escaping problems
@@ -184,8 +391,7 @@ def ask_codex(
     args = _build_args(codex, thread_id, sandbox, cwd, model, effort, last_path)
 
     try:
-        p = subprocess.run(args, input=prompt, capture_output=True,
-                           encoding="utf-8", errors="replace", timeout=timeout)
+        p = _run_codex_process(args, prompt, timeout)
     except subprocess.TimeoutExpired as e:
         # Recover the thread_id from the partial stdout: a paid xhigh session
         # stays resumable instead of being lost.
@@ -206,10 +412,33 @@ def ask_codex(
     if p.returncode != 0:
         text = ""  # do not trust the -o file on a failed run (may be stale/partial)
     else:
-        try:
-            text = Path(last_path).read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            text = ""
+        # The `--json` stream carries ALL messages of the turn;
+        # `--output-last-message` carries only the last one. We take the stream
+        # and fall back to the file: the fallback covers a schema change in the
+        # CLI, which would otherwise switch the driver off instead of degrading
+        # it. Order is emission order, so the last line stays the last line and
+        # `parse_verdict` still reads the right verdict.
+        messages, intact = _extract_agent_messages(p.stdout)
+        text = "\n\n".join(messages).strip()
+        if not text or not intact:
+            # DECLARED fallback. Undeclared, it degrades to exactly the historic
+            # defect — only the final message — and does so silently, i.e. the
+            # loop goes back to reading a wrap-up believing it is the audit.
+            try:
+                last = Path(last_path).read_text(
+                    encoding="utf-8", errors="replace").strip()
+            except OSError:
+                last = ""
+            if not text:
+                text, degraded = last, bool(last)
+            else:
+                degraded = True
+            if degraded:
+                _safe_unlink(last_path)
+                return CodexReply(text=text, thread_id=tid, exit_code=0,
+                                  error="incomplete --json stream: text may be "
+                                        "the final message only",
+                                  error_kind="degraded_last_only")
     _safe_unlink(last_path)
 
     if p.returncode != 0:
@@ -217,7 +446,7 @@ def ask_codex(
         return CodexReply("", tid, p.returncode, err, _classify_error(p.returncode, p.stderr))
     if not text:
         # exit 0 but no readable message: silent failure -> explicit diagnostic.
-        return CodexReply("", tid, 0, "codex ok but last-message empty/unreadable", "empty_output")
+        return CodexReply("", tid, 0, "ok but no readable agent message", "empty_output")
     return CodexReply(text=text, thread_id=tid, exit_code=0)
 
 
@@ -234,7 +463,7 @@ def _add_common_args(p) -> None:
     p.add_argument("--thread", help="thread_id to resume the session")
     p.add_argument("--model", help="reviewer model override (e.g. gpt-5.5)")
     p.add_argument("--effort", choices=list(VALID_EFFORT),
-                   help="reasoning effort (default: codex config). low/medium for simple tasks")
+                   help="reasoning effort (default: CLI config). low/medium for simple tasks")
     p.add_argument("--timeout", type=int, default=1800)
 
 
@@ -270,7 +499,8 @@ def _emit(r: CodexReply) -> int:
 def main(argv=None) -> int:
     import argparse
 
-    ap = argparse.ArgumentParser(prog="codex_bridge", description="One headless round with the Codex CLI")
+    ap = argparse.ArgumentParser(
+        prog="codex_bridge", description="One headless round with the reviewer CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("ask", help="send a prompt to the reviewer (configurable sandbox)")

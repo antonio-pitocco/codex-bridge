@@ -1,8 +1,12 @@
-"""Unit tests for codex_bridge (no real calls to Codex).
+"""Unit tests for codex_bridge (no real calls to the reviewer CLI).
 
 Hermetic: argv construction uses `_build_args` (no filesystem); tests of
 ask_codex mock `tempfile.mkstemp`/`os.close` so they run even where /tmp is
 not writable (e.g. a read-only sandbox).
+
+The only non-hermetic test is `TestProcessTreeTimeout`, which spawns real
+short-lived `sys.executable` processes: the process-group kill cannot be
+proven with a mock, and that is exactly the property worth proving.
 """
 from __future__ import annotations
 
@@ -10,7 +14,11 @@ import contextlib
 import io
 import json
 import subprocess
+import sys
+import tempfile
+import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from codex_bridge import bridge
@@ -18,6 +26,15 @@ from codex_bridge import bridge
 
 def _fake_run(returncode=0, stdout="", stderr=""):
     return mock.Mock(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+#: A MINIMAL but INTACT `--json` stream, in the shape verified live.
+STREAM_OK = "\n".join([
+    '{"type": "thread.started", "thread_id": "t-1"}',
+    '{"type": "item.completed", "item": {"id": "i0",'
+    ' "type": "agent_message", "text": "ok"}}',
+    '{"type": "turn.completed"}',
+])
 
 
 @contextlib.contextmanager
@@ -77,6 +94,34 @@ class TestConsensus(unittest.TestCase):
     def test_not_satisfied_never_consensus(self):
         self.assertFalse(bridge.consensus_reached(9, "trivial", "AGREE", False))
 
+    def test_malformed_never_consensus(self):
+        self.assertFalse(bridge.consensus_reached(9, "trivial", "MALFORMED", True))
+
+
+class TestShouldContinuePastCap(unittest.TestCase):
+    """The ceiling is an attention threshold, not a ban."""
+
+    def test_below_the_cap_always_continues(self):
+        self.assertTrue(bridge.should_continue_past_cap(1, "critical", 0, False))
+        self.assertTrue(bridge.should_continue_past_cap(2, "standard", 0, False))
+
+    def test_at_the_cap_continues_while_defects_are_still_found(self):
+        # 5 rounds done on critical, the last one still produced accepted defects
+        self.assertTrue(bridge.should_continue_past_cap(5, "critical", 2, False))
+        self.assertTrue(bridge.should_continue_past_cap(9, "critical", 1, False))
+
+    def test_at_the_cap_stops_when_the_last_round_produced_nothing(self):
+        self.assertFalse(bridge.should_continue_past_cap(5, "critical", 0, False))
+        self.assertFalse(bridge.should_continue_past_cap(3, "standard", 0, False))
+
+    def test_disagreement_on_merit_always_stops(self):
+        """More rounds do not dissolve a judgement call: a human does."""
+        self.assertFalse(bridge.should_continue_past_cap(1, "critical", 5, True))
+
+    def test_unknown_complexity_uses_the_highest_cap(self):
+        self.assertTrue(bridge.should_continue_past_cap(4, "whatever", 0, False))
+        self.assertFalse(bridge.should_continue_past_cap(5, "whatever", 0, False))
+
 
 class TestExtractThreadId(unittest.TestCase):
     def test_from_started(self):
@@ -88,6 +133,71 @@ class TestExtractThreadId(unittest.TestCase):
 
     def test_none_input(self):
         self.assertIsNone(bridge._extract_thread_id(None, None))
+
+
+class TestExtractAgentMessages(unittest.TestCase):
+    """The driver used to hand back the WRAP-UP instead of the audit.
+
+    A reviewer often closes a turn with a few lines of summary, and
+    `--output-last-message` writes only those: a real review round returned
+    713 and 135 characters while the actual messages of the turn were 14,427
+    and 25,931. The audit was being discarded and the summary kept.
+    Event shape reproduced from a real stream, not inferred.
+    """
+
+    STREAM = "\n".join([
+        '{"type": "thread.started", "thread_id": "t-1"}',
+        '{"type": "turn.started"}',
+        '{"type": "item.completed", "item": {"id": "item_0",'
+        ' "type": "agent_message", "text": "LONG AUDIT\\nlines and counterexamples"}}',
+        'non-JSON noise that must not break the parser',
+        '{"type": "item.completed", "item": {"id": "item_1",'
+        ' "type": "reasoning", "text": "reasoning, not a message"}}',
+        '{"type": "item.completed", "item": {"id": "item_2",'
+        ' "type": "agent_message", "text": "wrap-up\\n\\nVERDICT: OBJECT"}}',
+        '{"type": "turn.completed"}',
+    ])
+
+    def test_takes_every_message_not_only_the_last(self):
+        messages, intact = bridge._extract_agent_messages(self.STREAM)
+        self.assertEqual(len(messages), 2)
+        self.assertIn("LONG AUDIT", messages[0])
+        self.assertNotIn("reasoning", " ".join(messages))
+        self.assertTrue(intact)
+
+    def test_verdict_is_still_the_last_line_after_joining(self):
+        text = "\n\n".join(bridge._extract_agent_messages(self.STREAM)[0])
+        self.assertIn("LONG AUDIT", text)
+        self.assertEqual(bridge.parse_verdict(text), "OBJECT")
+
+    def test_empty_or_unreadable_stream(self):
+        for stream in ("", None, '{"type": "turn.started"}'):
+            self.assertEqual(bridge._extract_agent_messages(stream)[0], [])
+        messages, intact = bridge._extract_agent_messages("{not json")
+        self.assertEqual(messages, [])
+        self.assertFalse(intact)
+
+    def test_item_updated_does_not_add_up_to_the_completion(self):
+        """Matching on `item.type` alone also accepted partials: an
+        `item.updated` duplicated the text of the `item.completed` that
+        followed, and a partial left alone suppressed the fallback because
+        `text` was not empty."""
+        stream = "\n".join([
+            '{"type": "item.updated", "item": {"id": "a",'
+            ' "type": "agent_message", "text": "PARTIAL"}}',
+            '{"type": "item.completed", "item": {"id": "a",'
+            ' "type": "agent_message", "text": "FINAL"}}',
+            '{"type": "turn.completed"}',
+        ])
+        self.assertEqual(bridge._extract_agent_messages(stream)[0], ["FINAL"])
+
+    def test_stream_without_turn_completed_is_not_intact(self):
+        """A truncated stream must not be presented as a complete audit."""
+        only_partial = ('{"type": "item.updated", "item": {"id": "a",'
+                        ' "type": "agent_message", "text": "PARTIAL"}}')
+        messages, intact = bridge._extract_agent_messages(only_partial)
+        self.assertEqual(messages, [])
+        self.assertFalse(intact)
 
 
 class TestBuildArgs(unittest.TestCase):
@@ -118,21 +228,51 @@ class TestCwdDefault(unittest.TestCase):
         # domain-agnostic default: cwd=None -> the round-1 argv carries os.getcwd()
         seen = {}
 
-        def fake(args, **kw):
+        def fake(args, prompt, timeout):
             seen["args"] = args
-            return _fake_run()
+            return _fake_run(stdout=STREAM_OK)
 
-        with _fake_temp(), mock.patch.object(bridge.subprocess, "run", side_effect=fake), \
-             mock.patch.object(bridge.os, "getcwd", return_value="/here/now"), \
-             mock.patch.object(bridge.Path, "read_text", return_value="ok"):
+        with _fake_temp(), mock.patch.object(bridge, "_run_codex_process", side_effect=fake), \
+             mock.patch.object(bridge.os, "getcwd", return_value="/here/now"):
             bridge.ask_codex("p")          # no cwd -> defaults to getcwd()
         i = seen["args"].index("-C")
         self.assertEqual(seen["args"][i + 1], "/here/now")
 
 
+class TestAskCodexWiring(unittest.TestCase):
+    def test_prompt_via_stdin(self):
+        seen = {}
+
+        def fake(args, prompt, timeout):
+            seen["input"] = prompt
+            seen["timeout"] = timeout
+            return _fake_run(stdout=STREAM_OK)
+
+        with _fake_temp(), mock.patch.object(bridge, "_run_codex_process", side_effect=fake):
+            r = bridge.ask_codex("PROMPT")
+        self.assertEqual(seen["input"], "PROMPT")
+        self.assertTrue(r.ok)
+        self.assertEqual(r.text, "ok")
+
+    def test_without_the_json_stream_the_round_is_NOT_valid(self):
+        """Falling back to `--output-last-message` alone is exactly the historic
+        defect — the loop received the wrap-up believing it was the audit. The
+        fallback survives as a diagnostic but is NOT a round: `ok` is false, the
+        verdict is not computed, and the command exits non-zero."""
+        with _fake_temp(), \
+             mock.patch.object(bridge, "_run_codex_process",
+                               return_value=_fake_run(stdout="")), \
+             mock.patch.object(bridge.Path, "read_text",
+                               return_value="wrap-up\n\nVERDICT: AGREE"):
+            r = bridge.ask_codex("PROMPT")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error_kind, "degraded_last_only")
+        self.assertIn("wrap-up", r.text, "the text stays for diagnostics")
+
+
 class TestAskCodexErrorPaths(unittest.TestCase):
     def _run(self, **patch_run):
-        with _fake_temp(), mock.patch.object(bridge.subprocess, "run", **patch_run):
+        with _fake_temp(), mock.patch.object(bridge, "_run_codex_process", **patch_run):
             return bridge.ask_codex("p", "thr-1")
 
     def test_timeout_recovers_thread_id(self):
@@ -143,7 +283,7 @@ class TestAskCodexErrorPaths(unittest.TestCase):
         self.assertEqual(r.thread_id, "rec")
 
     def test_codex_missing(self):
-        r = self._run(side_effect=FileNotFoundError("no codex"))
+        r = self._run(side_effect=FileNotFoundError("binary not found"))
         self.assertEqual(r.error_kind, "codex_missing")
 
     def test_permission_error(self):
@@ -155,23 +295,63 @@ class TestAskCodexErrorPaths(unittest.TestCase):
         self.assertEqual(r.text, "")
         self.assertEqual(r.error_kind, "resume_invalid")
 
+    def test_exit_zero_but_silent_is_diagnosed(self):
+        with _fake_temp(), \
+             mock.patch.object(bridge, "_run_codex_process",
+                               return_value=_fake_run(stdout='{"type": "turn.completed"}')), \
+             mock.patch.object(bridge.Path, "read_text", return_value=""):
+            r = bridge.ask_codex("p")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.error_kind, "empty_output")
+
     def test_temp_unavailable(self):
         with mock.patch.object(bridge, "_codex_bin", return_value="codex"), \
              mock.patch.object(bridge.tempfile, "mkstemp", side_effect=OSError("no temp")):
             r = bridge.ask_codex("p")
         self.assertEqual(r.error_kind, "temp_unavailable")
 
-    def test_prompt_via_stdin(self):
-        seen = {}
 
-        def fake(args, **kw):
-            seen["input"] = kw.get("input")
-            return _fake_run()
+class TestProcessTreeTimeout(unittest.TestCase):
+    """`subprocess.run(timeout=...)` does not kill grandchildren.
 
-        with _fake_temp(), mock.patch.object(bridge.subprocess, "run", side_effect=fake), \
-             mock.patch.object(bridge.Path, "read_text", return_value="ok"):
-            bridge.ask_codex("PROMPT")
-        self.assertEqual(seen["input"], "PROMPT")
+    A child that ignores TERM keeps the pipes open, so `communicate()` blocks
+    long past the deadline: the timeout is nominal, not real. This test spawns
+    a parent that forks a TERM-ignoring child and asserts that neither survives.
+    """
+
+    def test_timeout_kills_the_child_too_and_leaves_no_orphan(self):
+        with tempfile.TemporaryDirectory() as td:
+            sentinel = Path(td) / "orphan-survived"
+            grandchild = (
+                "import pathlib,signal,time;"
+                "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+                "time.sleep(0.6);"
+                f"pathlib.Path({str(sentinel)!r}).write_text('alive')"
+            )
+            parent = (
+                "import subprocess,sys,time;"
+                f"subprocess.Popen([sys.executable,'-c',{grandchild!r}]);"
+                "time.sleep(60)"
+            )
+            started = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                bridge._run_codex_process([sys.executable, "-c", parent], "", timeout=0.1)
+            self.assertLess(time.monotonic() - started, 2.5)
+            # If only the parent were killed, the grandchild would write this
+            # file after 0.6s. The whole group must disappear instead.
+            time.sleep(0.8)
+            self.assertFalse(sentinel.exists(), "grandchild survived the timeout")
+
+
+class TestCodexReply(unittest.TestCase):
+    def test_ok_property(self):
+        self.assertTrue(bridge.CodexReply("text", "t", 0).ok)
+        self.assertFalse(bridge.CodexReply("", "t", 0).ok)
+        self.assertFalse(bridge.CodexReply("text", "t", 1).ok)
+
+    def test_degraded_round_is_not_ok(self):
+        self.assertFalse(
+            bridge.CodexReply("text", "t", 0, error_kind="degraded_last_only").ok)
 
 
 class TestValidation(unittest.TestCase):
@@ -199,6 +379,16 @@ class TestMainCli(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(d["verdict"], "AGREE")
 
+    def test_degraded_round_exits_nonzero_and_has_no_verdict(self):
+        reply = bridge.CodexReply("wrap-up\nVERDICT: AGREE", "t1", 0,
+                                  error_kind="degraded_last_only")
+        with mock.patch.object(bridge, "ask_codex", return_value=reply):
+            code, out = self._main(["verify", "--prompt", "hi"])
+        d = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertFalse(d["ok"])
+        self.assertIsNone(d["verdict"], "a degraded round must not carry a verdict")
+
     def test_verify_forces_read_only(self):
         seen = {}
 
@@ -213,6 +403,14 @@ class TestMainCli(unittest.TestCase):
     def test_verify_rejects_sandbox(self):
         with self.assertRaises(SystemExit):
             self._main(["verify", "--prompt", "hi", "--sandbox", "workspace-write"])
+
+    def test_missing_prompt_file_is_a_clean_error(self):
+        with self.assertRaises(SystemExit):
+            self._main(["ask", "--prompt-file", "/nonexistent/prompt.txt"])
+
+    def test_empty_prompt_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            self._main(["ask", "--prompt", "   "])
 
 
 if __name__ == "__main__":
